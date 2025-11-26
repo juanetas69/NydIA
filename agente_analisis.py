@@ -2,38 +2,37 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import io
-
-# ----------------------------------------------------
-# CONFIGURACIÓN DE LA PÁGINA
-# ----------------------------------------------------
-st.set_page_config(layout="wide", page_title="Agente de Análisis Libre")
+# Usaremos 'io' para manejar el contenido binario de los archivos subidos.
 
 # ----------------------------------------------------
 # 1. FUNCIÓN DE PERCEPCIÓN Y CONSOLIDACIÓN (El 'Oído' del Agente)
 # ----------------------------------------------------
-@st.cache_data
+# Tarea: Leer múltiples archivos Excel subidos por el usuario y unirlos en un solo DataFrame.
+
+@st.cache_data # Streamlit "memoriza" el resultado si las entradas no cambian, ¡haciéndolo rápido!
 def consolidar_archivos_excel(uploaded_files):
     """Procesa una lista de archivos subidos y devuelve un DataFrame consolidado."""
     
+    # Si no hay archivos, no hay percepto.
     if not uploaded_files:
         return pd.DataFrame() 
 
     dataframes = []
     
+    # Itera sobre cada archivo que el usuario ha subido
     for file in uploaded_files:
         try:
-            # Lee el contenido binario del archivo subido.
-            df = pd.read_excel(io.BytesIO(file.getvalue()), engine='openpyxl')
+            # Lee el contenido del archivo subido. 
+            # io.BytesIO(file.getvalue()) convierte el archivo de Streamlit en un objeto que pandas puede leer.
+            df = pd.read_excel(io.BytesIO(file.getvalue()))
             dataframes.append(df)
         except Exception as e:
+            # Muestra un mensaje de error si no puede leer alguno de los archivos.
             st.error(f"Error al leer el archivo {file.name}: {e}")
             
+    # Combina todos los DataFrames apilándolos (uno debajo del otro)
     if dataframes:
-        # Combina todos los DataFrames apilándolos (uno debajo del otro)
         df_consolidado = pd.concat(dataframes, ignore_index=True)
-        
-        # Intentar inferir tipos para mejor manejo
-        df_consolidado = df_consolidado.infer_objects() 
         return df_consolidado
     else:
         return pd.DataFrame()
@@ -42,167 +41,85 @@ def consolidar_archivos_excel(uploaded_files):
 # ----------------------------------------------------
 # 2. FUNCIÓN DE ACCIÓN E INTERACCIÓN (El 'Cerebro' del Agente)
 # ----------------------------------------------------
-def interfaz_agente_analisis(df_original):
-    """Crea la interfaz de Streamlit para la interacción, filtrado y visualización."""
+# Tarea: Interactuar con el usuario (pedir ejes) y generar la gráfica.
+
+def interfaz_agente_analisis(df):
+    """Crea la interfaz de Streamlit para la interacción y visualización."""
     
-    st.title("📊 Agente de Análisis Libre y Compartible (Avanzado)")
-    st.markdown("Este agente consolida tus archivos de Excel, permite aplicar filtros dinámicos y genera gráficos interactivos con Plotly.", help="Desarrollado con Software Libre: Python, Pandas y Streamlit.")
+    st.title("📊 Agente de Análisis Libre y Compartible")
     st.markdown("---")
     
-    if df_original.empty:
-        st.warning("Por favor, sube uno o más archivos de Excel para que el agente pueda analizar los datos.")
-        return
-
-    # Creamos una copia del DataFrame para aplicar los filtros
-    df = df_original.copy()
-    
-    # ------------------------------------
-    # A. FILTROS DINÁMICOS
-    # ------------------------------------
-    st.sidebar.header("🔍 1. Aplicar Filtros")
-    
-    # Filtros de Texto (Categorías)
-    st.sidebar.subheader("Filtros por Categoría:")
-    
-    # Solo mostrar filtros para columnas de texto que no tengan demasiados valores únicos
-    text_cols = df.select_dtypes(include=['object']).columns
-    
-    for col in text_cols:
-        # Si tiene demasiados valores únicos (ej. más de 50), lo ignoramos para no saturar la interfaz
-        if df[col].nunique() <= 50:
-            opciones_filtro = ['TODOS'] + sorted(df[col].dropna().unique().tolist())
-            seleccion = st.sidebar.selectbox(f"Filtrar por **{col}**:", opciones_filtro)
-            
-            if seleccion != 'TODOS':
-                df = df[df[col] == seleccion]
-            
-    
-    # Filtro de Rango Numérico
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Filtro por Rango:")
-    
-    columnas_numericas = df_original.select_dtypes(include=['number']).columns.tolist()
-    
-    if columnas_numericas:
-        col_num_a_filtrar = st.sidebar.selectbox("Columna a Filtrar por Rango:", ['Seleccionar'] + columnas_numericas)
-        
-        if col_num_a_filtrar != 'Seleccionar':
-            min_val = float(df_original[col_num_a_filtrar].min())
-            max_val = float(df_original[col_num_a_filtrar].max())
-            
-            rango_seleccionado = st.sidebar.slider(
-                f"Rango de {col_num_a_filtrar}",
-                min_value=min_val,
-                max_value=max_val,
-                value=(min_val, max_val),
-                # El paso se ajusta dinámicamente para ser el 1% del rango total
-                step=max(0.01, (max_val - min_val) / 100)
-            )
-            # Aplicamos el filtro al DataFrame
-            df = df[
-                (df[col_num_a_filtrar] >= rango_seleccionado[0]) & 
-                (df[col_num_a_filtrar] <= rango_seleccionado[1])
-            ]
-    
-    # Si después de los filtros el DataFrame está vacío, notificamos al usuario
     if df.empty:
-        st.error("No hay datos para graficar después de aplicar los filtros. Intenta suavizar los filtros.")
-        st.markdown(f"Filas originales: {len(df_original)} | Filas filtradas: 0")
+        st.warning("Por favor, sube uno o más archivos de Excel para que el agente pueda analizar los datos y generar gráficos.")
         return
 
+    # Limpieza básica: El agente intenta convertir las columnas a tipos estándar
+    df = df.infer_objects() 
+
     # ------------------------------------
-    # B. CONFIGURACIÓN DEL GRÁFICO
+    # A. INTERACCIÓN (Definición de Perceptos del Usuario)
     # ------------------------------------
-    st.sidebar.markdown("---")
-    st.sidebar.header("📈 2. Configuración de Gráfico")
+    st.sidebar.header("⚙️ Configuración del Gráfico")
     
-    columnas_disponibles = df.columns.tolist() 
-    columnas_numericas_filtradas = df.select_dtypes(include=['number']).columns.tolist()
+    # El agente identifica automáticamente las columnas numéricas y no numéricas
+    columnas_numericas = df.select_dtypes(include=['number']).columns.tolist()
+    columnas_dimensiones = df.columns.tolist() # Se pueden usar todas las columnas como eje X
 
-    if not columnas_numericas_filtradas:
-        st.error("La selección actual no contiene columnas numéricas para la Métrica (Eje Y).")
+    if not columnas_numericas:
+        st.error("El agente no encontró columnas con datos numéricos para graficar (Métrica).")
         return
 
-    # Selecciones del usuario
+    # El agente le pide al usuario que defina los ejes
     eje_x = st.sidebar.selectbox(
-        "Dimensión (Eje X):", 
-        columnas_disponibles, 
-        index=0 if columnas_disponibles else None
+        "1. Selecciona la Dimensión (Eje X):", 
+        columnas_dimensiones, 
+        index=0 if columnas_dimensiones else None
     )
     eje_y = st.sidebar.selectbox(
-        "Métrica (Eje Y):", 
-        columnas_numericas_filtradas,
-        index=0 if columnas_numericas_filtradas else None
+        "2. Selecciona la Métrica (Eje Y):", 
+        columnas_numericas,
+        index=0 if columnas_numericas else None
     )
-
     tipo_grafico = st.sidebar.selectbox(
-        "Tipo de Gráfico:", 
-        ['Barras', 'Líneas', 'Dispersión (Scatter)', 'Histograma', 'Caja (Box Plot)']
+        "3. Selecciona el Tipo de Gráfico:", 
+        ['Barras', 'Líneas', 'Dispersión (Scatter)']
     )
 
-    # Opciones de Agregación, solo para gráficos que lo requieren
-    metodo_agregacion = 'Ninguna'
-    if tipo_grafico in ['Barras', 'Líneas']:
-        metodo_agregacion = st.sidebar.selectbox(
-            "Método de Agregación:", 
-            ['Suma', 'Promedio', 'Conteo']
-        )
-    
-    
     # ------------------------------------
-    # C. GENERACIÓN DEL GRÁFICO
+    # B. GENERACIÓN DE GRÁFICO (La Acción Final)
     # ------------------------------------
     
-    st.subheader(f"Análisis | Tipo: **{tipo_grafico}** | Filas analizadas: {len(df)}")
+    st.subheader(f"Gráfico de **{tipo_grafico}** | {eje_y} vs {eje_x}")
 
-    try:
-        if tipo_grafico in ['Barras', 'Líneas']:
-            
-            # 1. Agregación de datos
-            if metodo_agregacion == 'Suma':
-                df_agregado = df.groupby(eje_x)[eje_y].sum().reset_index(name=f'Suma de {eje_y}')
-            elif metodo_agregacion == 'Promedio':
-                df_agregado = df.groupby(eje_x)[eje_y].mean().reset_index(name=f'Promedio de {eje_y}')
-            else: # Conteo
-                df_agregado = df.groupby(eje_x).size().reset_index(name='Conteo de Elementos')
-            
-            # 2. Creación del gráfico
-            y_col_name = df_agregado.columns[-1] 
-            
-            if tipo_grafico == 'Barras':
-                fig = px.bar(df_agregado, x=eje_x, y=y_col_name, title=f"{metodo_agregacion} de {eje_y} por {eje_x}")
-            else:
-                fig = px.line(df_agregado, x=eje_x, y=y_col_name, title=f"Tendencia: {metodo_agregacion} de {eje_y} a lo largo de {eje_x}")
-
-        elif tipo_grafico == 'Dispersión (Scatter)':
-            fig = px.scatter(df, x=eje_x, y=eje_y, title=f"Relación entre {eje_x} y {eje_y}", hover_data=columnas_disponibles)
-            
-        elif tipo_grafico == 'Histograma':
-            # Eje X puede ser cualquier columna, pero se mide el conteo o distribución de una métrica
-            fig = px.histogram(df, x=eje_y, title=f"Distribución de {eje_y}", histfunc=metodo_agregacion.lower() if metodo_agregacion != 'Ninguna' else None)
-            
-        elif tipo_grafico == 'Caja (Box Plot)':
-            # Muestra estadísticas clave (mediana, cuartiles) de la métrica por dimensión
-            fig = px.box(df, x=eje_x, y=eje_y, title=f"Distribución de {eje_y} por {eje_x}")
-            
-        # Muestra el gráfico interactivo
-        st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Ocurrió un error al generar el gráfico. Asegúrate de que las columnas seleccionadas sean adecuadas para el tipo de gráfico: {e}")
+    if tipo_grafico == 'Barras':
+        # Para barras, agrupamos la dimensión para sumar o promediar la métrica
+        df_agrupado = df.groupby(eje_x)[eje_y].sum().reset_index(name=f'Suma de {eje_y}')
+        fig = px.bar(df_agrupado, x=eje_x, y=f'Suma de {eje_y}', 
+                     title=f"Suma de {eje_y} por {eje_x}")
+                     
+    elif tipo_grafico == 'Líneas':
+        fig = px.line(df, x=eje_x, y=eje_y, 
+                      title=f"Tendencia de {eje_y} a lo largo de {eje_x}")
+                      
+    else: # Dispersión (Scatter)
+        fig = px.scatter(df, x=eje_x, y=eje_y, 
+                         title=f"Relación entre {eje_x} y {eje_y}")
+        
+    # Muestra el gráfico interactivo (característica de Plotly)
+    st.plotly_chart(fig, use_container_width=True)
     
     st.markdown("---")
-    st.caption(f"Filas originales consolidadas: {len(df_original)} | Filas analizadas después de filtros: {len(df)}")
+    st.caption(f"El agente ha consolidado {len(df)} filas de datos.")
 
 
 # ----------------------------------------------------
 # 3. EL BUCLE PRINCIPAL DEL AGENTE
 # ----------------------------------------------------
+
 def main():
-    
     # PERCEPCIÓN (Entorno): Pide al usuario que suba los archivos de Excel
     uploaded_files = st.file_uploader(
-        "Carga tus archivos de Excel (.xlsx o .xls):", 
+        "Carga tus archivos de Excel (.xlsx o .xls) de la nube:", 
         type=["xlsx", "xls"], 
         accept_multiple_files=True
     )
