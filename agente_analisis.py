@@ -3,14 +3,23 @@ import pandas as pd
 import plotly.express as px
 import io
 import re
-import time
 import json
-import base64
+import requests
+import time # Para implementar la lógica de reintento (backoff)
 
 # ----------------------------------------------------
 # CONFIGURACIÓN DE LA PÁGINA
 # ----------------------------------------------------
-st.set_page_config(layout="wide", page_title="NydIA: Agente de Análisis Asistido por Gemini")
+st.set_page_config(layout="wide", page_title="NydIA: Agente de Análisis con NLP Avanzado")
+
+# ----------------------------------------------------
+# CONFIGURACIÓN DE LA API DE GEMINI
+# ----------------------------------------------------
+# La clave de API se obtiene del entorno de ejecución (Canvas)
+API_KEY = ""
+API_MODEL = "gemini-2.5-flash-preview-09-2025"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{API_MODEL}:generateContent?key={API_KEY}"
+MAX_RETRIES = 5
 
 # ----------------------------------------------------
 # 1. FUNCIÓN DE PERCEPCIÓN Y CONSOLIDACIÓN (Compatibilidad total de archivos)
@@ -32,21 +41,18 @@ def consolidar_archivos(uploaded_files):
                 # Lectura de Excel
                 df = pd.read_excel(io.BytesIO(file.getvalue()), engine='openpyxl')
             elif file_extension == 'csv':
-                # Lectura de CSV: Intentamos coma (,) y luego punto y coma (;), luego tab
+                # Lectura de CSV: Intentamos coma (,) y luego punto y coma (;)
                 file_content = io.StringIO(file.getvalue().decode('utf-8', errors='ignore'))
                 
-                # Intentamos detectar el delimitador (comma, semicolon, or tab)
+                # Intento 1: Coma como delimitador
                 try:
-                    df = pd.read_csv(file_content, sep=',', on_bad_lines='skip')
+                    df = pd.read_csv(file_content, delimiter=',', on_bad_lines='skip', encoding='utf-8')
                 except Exception:
-                    file_content.seek(0)
-                    try:
-                        df = pd.read_csv(file_content, sep=';', on_bad_lines='skip')
-                    except Exception:
-                        file_content.seek(0)
-                        df = pd.read_csv(file_content, sep='\t', on_bad_lines='skip')
+                    # Intento 2: Punto y coma como delimitador
+                    file_content.seek(0) # Resetear el puntero
+                    df = pd.read_csv(file_content, delimiter=';', on_bad_lines='skip', encoding='utf-8')
             else:
-                st.warning(f"Formato no soportado para el archivo {file.name}. Se omitirá.")
+                st.warning(f"Tipo de archivo no soportado: {file.name}")
                 continue
 
             dataframes.append(df)
@@ -62,453 +68,305 @@ def consolidar_archivos(uploaded_files):
         return pd.DataFrame()
 
 # ----------------------------------------------------
-# 2. FUNCIÓN DE LIMPIEZA Y PREPARACIÓN DE DATOS (Incluye Manejo de Fechas)
+# 2. FUNCIÓN DE COGNICIÓN: GENERACIÓN DE INSIGHTS CON GEMINI (Integración de IA)
 # ----------------------------------------------------
-def limpiar_y_preparar_datos(df):
-    """Limpia nombres de columnas y convierte tipos de datos, incluyendo fechas."""
-    
-    # 1. Limpieza de nombres de columnas
-    nuevas_columnas = {}
-    for col in df.columns:
-        # Reemplazar caracteres especiales y espacios por guiones bajos
-        limpio = re.sub(r'[^\w\s-]', '', str(col)).strip()
-        limpio = re.sub(r'\s+', '_', limpio)
-        limpio = limpio.lower()
-        nuevas_columnas[col] = limpio
-    df = df.rename(columns=nuevas_columnas)
+def generar_insight_con_gemini(df_insight, eje_x, eje_y, tipo_grafico, pregunta_nlp):
+    """
+    Genera un insight analítico utilizando la API de Gemini.
+    Envía una porción del DataFrame y el contexto de la pregunta para obtener un resumen.
+    """
+    if df_insight.empty:
+        return "No hay datos para analizar. Por favor, ajusta los filtros."
 
-    # 2. Conversión a tipos estándar y manejo de fechas
-    df_cleaned = df.copy()
-    for col in df_cleaned.columns:
-        try:
-            # Intentar convertir a numérico (útil para cadenas numéricas)
-            df_cleaned[col] = pd.to_numeric(df_cleaned[col], errors='coerce')
-        except:
-            # Si no es numérico, intentar convertir a datetime
-            try:
-                # Usar infer_datetime_format=True para mejor detección de formatos
-                df_cleaned[col] = pd.to_datetime(df_cleaned[col], errors='coerce', infer_datetime_format=True)
-            except:
-                # Si falla, intentar convertir a string para limpieza
-                if df_cleaned[col].dtype == 'object':
-                    df_cleaned[col] = df_cleaned[col].astype(str).str.strip().replace('nan', pd.NA).fillna(pd.NA)
-    
-    # Eliminar filas con todos los valores como NA/nulos después de la limpieza
-    df_cleaned.dropna(how='all', inplace=True)
-    
-    return df_cleaned.infer_objects()
+    # 1. Preparar el contexto de los datos (solo un resumen y las primeras 5 filas)
+    data_summary = f"""
+    Resumen Estadístico del DataFrame filtrado (describe):\n
+    {df_insight.describe(include='all').to_markdown()}
 
-# ----------------------------------------------------
-# 3. FUNCIÓN DE FILTRADO INTERACTIVO
-# ----------------------------------------------------
-def aplicar_filtros(df):
-    """Aplica filtros interactivos al DataFrame y almacena el resultado en session_state."""
+    Primeras 5 filas del DataFrame filtrado:\n
+    {df_insight.head(5).to_markdown()}
+    """
     
-    df_filtrado = df.copy()
-    
-    st.sidebar.markdown("### 2. Filtros Dinámicos")
-    
-    # Identificar columnas para filtrado
-    columnas_disponibles = df_filtrado.columns.tolist()
-    columnas_filtrables = [col for col in columnas_disponibles if df_filtrado[col].nunique() < 50 and df_filtrado[col].dtype not in ['datetime64[ns]']]
-
-    # Contenedor para los filtros
-    with st.sidebar.expander("Añadir / Remover Filtros"):
-        for col in columnas_filtrables:
-            valores_unicos = sorted(df_filtrado[col].dropna().unique().tolist())
-            
-            # Crear un identificador de clave único para cada filtro
-            key = f"filter_{col}"
-
-            # Multiselect para aplicar el filtro
-            seleccion = st.multiselect(
-                f"Filtrar por: {col}",
-                options=valores_unicos,
-                default=[],
-                key=key
+    # 2. Definir la instrucción del sistema (Persona y Formato)
+    system_prompt = {
+        "parts": [{
+            "text": (
+                "Actúa como un analista de datos experto y conciso, especializado en el análisis de "
+                "archivos tabulares (Excel/CSV). Tu tarea es examinar los datos proporcionados, "
+                "el contexto de las columnas seleccionadas y la pregunta del usuario. "
+                "Genera un único párrafo de análisis en español, identificando tendencias, "
+                "valores atípicos, o la respuesta más relevante a la pregunta. "
+                "Sé profesional y directo. No uses encabezados ni Markdown para el formato."
             )
-            
-            if seleccion:
-                # Filtrar el DataFrame
-                df_filtrado = df_filtrado[df_filtrado[col].isin(seleccion)]
-
-    # Filtros para columnas numéricas
-    columnas_numericas = df.select_dtypes(include=['number']).columns.tolist()
-    
-    if columnas_numericas:
-          with st.sidebar.expander("Filtros Numéricos (Rango)"):
-            for col in columnas_numericas:
-                min_val = df[col].min()
-                max_val = df[col].max()
-                
-                # Solo mostrar si hay un rango significativo
-                if min_val != max_val:
-                    rango = st.slider(
-                        f"Rango para: {col}",
-                        min_value=float(min_val),
-                        max_value=float(max_val),
-                        value=(float(min_val), float(max_val)),
-                        key=f"slider_{col}"
-                    )
-                    df_filtrado = df_filtrado[(df_filtrado[col] >= rango[0]) & (df_filtrado[col] <= rango[1])]
-    
-    # Guardar el resultado del filtrado en el estado de la sesión
-    st.session_state.df_filtrado = df_filtrado
-    return df_filtrado
-
-# ----------------------------------------------------
-# 4. FUNCIÓN DE API LLAMADA (Para Análisis) - CORREGIDA Y ROBUSTA
-# ----------------------------------------------------
-def agente_analisis_llm(df, user_query):
-    """Llama al modelo Gemini para análisis basado en un prompt del usuario y el resumen de datos."""
-    
-    # 1. Crear un resumen de datos para el modelo
-    # Mostrar las primeras 5 filas y la estructura (dtypes)
-    data_summary = f"Estructura del DataFrame (Columnas y Tipos):\n{df.dtypes.to_string()}\n\n"
-    data_summary += f"Primeras 5 filas (para contexto de datos):\n{df.head().to_string()}"
-    
-    # 2. Construir el prompt para el modelo
-    system_prompt = (
-        "Eres un analista de datos experto y asistente de IA llamado NydIA. Tu tarea es analizar la 'consulta del usuario' "
-        "en el contexto del 'resumen de datos' proporcionado (que incluye la estructura y una muestra de los datos). "
-        "Genera una respuesta profesional, concisa y perspicaz en ESPAÑOL. "
-        "Si la consulta es sobre análisis de negocios o tendencias, enfócate en los datos y los insights. "
-        "Si la consulta es sobre cómo graficar, proporciona el mejor TIPO de gráfico y las COLUMNAS adecuadas (eje X, Y, Color, etc.) "
-        "basándote en el resumen de datos para guiar al usuario a la sección 5."
-    )
-    
-    user_query_full = f"Resumen de Datos:\n{data_summary}\n\nConsulta del Usuario: {user_query}\n\nRespuesta del Análisis:"
-    
-    # 3. Parámetros de la API
-    # La apiKey se deja vacía para que el entorno de Canvas la inyecte automáticamente.
-    apiKey = "" 
-    apiUrl = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
-    
-    payload = {
-        "contents": [{"parts": [{"text": user_query_full}]}],
-        "tools": [{"google_search": {}}], # Útil para contexto general fuera de los datos
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        }]
     }
-    
-    headers = {'Content-Type': 'application/json'}
-    
-    # 4. Implementación de Backoff para la llamada API
-    max_retries = 3
-    base_delay = 1.0 # segundos
 
-    for attempt in range(max_retries):
+    # 3. Construir el prompt del usuario (Pregunta y Datos)
+    user_query = f"""
+    Contexto del Análisis:
+    - Columna(s) principal(es) del eje X (Categoría/Tiempo): '{eje_x}'
+    - Columna(s) principal(es) del eje Y (Valor/Medida): '{eje_y}'
+    - Tipo de Gráfico sugerido: '{tipo_grafico}'
+    
+    Pregunta Específica del Usuario: '{pregunta_nlp}'
+
+    ---
+    
+    Datos a Analizar (Resumen y Muestra):
+    {data_summary}
+    
+    Por favor, proporciona un insight analítico en español de un solo párrafo que responda a la pregunta del usuario basándote en los datos.
+    """
+    
+    # 4. Construir el payload de la API
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        "systemInstruction": system_prompt,
+    }
+
+    # 5. Llamada a la API con reintento (Exponential Backoff)
+    for attempt in range(MAX_RETRIES):
         try:
-            # st.runtime.scriptrunner.fetch_wrapper is used to perform the fetch in the environment
-            response = st.runtime.scriptrunner.fetch_wrapper(
-                apiUrl, 
-                method='POST', 
-                headers=headers, 
-                body=json.dumps(payload)
-            )
-            
-            # Asumimos que response es un objeto con un método json()
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(API_URL, headers=headers, data=json.dumps(payload))
+            response.raise_for_status() # Lanza una excepción para errores 4xx/5xx
+
             result = response.json()
+            candidate = result.get('candidates', [{}])[0]
             
-            if response.status_code == 200 and 'candidates' in result and result['candidates']:
-                text = result['candidates'][0]['content']['parts'][0]['text']
-                return text
-            elif response.status_code == 429:
-                raise Exception("Tasa límite excedida (429)") # Forzamos el reintento
-            else:
-                st.warning(f"La API de Gemini devolvió un error (Estado: {response.status_code}).")
-                return f"Error: No se pudo generar la respuesta de análisis. Código de estado: {response.status_code}"
+            if candidate and candidate.get('content') and candidate['content'].get('parts'):
+                return candidate['content']['parts'][0]['text']
+            
+            return "La IA no pudo generar un insight claro. Intente con una pregunta diferente o más datos."
 
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt
+                # st.warning(f"Error de API: {e}. Reintentando en {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                st.error(f"Error fatal al conectar con la IA después de {MAX_RETRIES} intentos: {e}")
+                return "Error en la conexión con la IA. No se pudo generar el insight."
         except Exception as e:
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt) # Retardo exponencial
-                time.sleep(delay)
-                continue # Intentar de nuevo
-            else:
-                return f"Error de comunicación con la API (después de {max_retries} intentos): {e}"
-    
-    return "Error desconocido en el proceso de análisis."
+            st.error(f"Ocurrió un error inesperado al procesar la respuesta de la IA: {e}")
+            return "Error interno al procesar el insight de la IA."
+
+    return "No se pudo generar el insight."
+
 
 # ----------------------------------------------------
-# 5. FUNCIÓN DE VISUALIZACIÓN INTERACTIVA (Gráficos)
+# 3. FUNCIÓN DE ACCIÓN: FILTRADO Y VISUALIZACIÓN
 # ----------------------------------------------------
-def generar_grafico_interactivo(df_original, df):
-    """Muestra un panel para seleccionar y generar gráficos interactivos con Plotly."""
-
-    st.markdown("### 5. Generación de Gráficos Interactivos")
+def seccion_analisis(df_original, pregunta_nlp):
+    """
+    Permite al usuario filtrar, seleccionar variables y visualizar datos.
+    """
     
-    # Identificar columnas por tipo
-    columnas_disponibles = df.columns.tolist()
-    columnas_numericas = df.select_dtypes(include=['number']).columns.tolist()
-    columnas_texto_fecha = [col for col in columnas_disponibles if col not in columnas_numericas]
-    columnas_fecha = df.select_dtypes(include=['datetime64[ns]']).columns.tolist()
+    # A. FILTROS BÁSICOS
+    st.subheader("A. Filtrado de Datos")
+    
+    df = df_original.copy()
+    columnas_disponibles = list(df.columns)
+    
+    with st.expander("Aplicar Filtros al DataFrame"):
+        # Detectar columnas de texto (object o string)
+        columnas_texto = [col for col in columnas_disponibles if df[col].dtype in ['object', 'string', 'category']]
+        
+        filtros_aplicados = False
+        
+        # Filtro por columnas de texto
+        if columnas_texto:
+            col_filtro_texto = st.selectbox("Columna para filtrar (Texto)", [''] + columnas_texto, index=0)
+            if col_filtro_texto:
+                valores_unicos = df[col_filtro_texto].unique()
+                valores_seleccionados = st.multiselect(f"Seleccionar valores para {col_filtro_texto}", valores_unicos)
+                if valores_seleccionados:
+                    df = df[df[col_filtro_texto].isin(valores_seleccionados)]
+                    filtros_aplicados = True
+        
+        # Filtro por columnas numéricas
+        columnas_numericas = df.select_dtypes(include=['number']).columns.tolist()
+        if columnas_numericas:
+            col_filtro_num = st.selectbox("Columna para filtrar (Numérico)", [''] + columnas_numericas, index=0)
+            if col_filtro_num:
+                min_val = float(df[col_filtro_num].min())
+                max_val = float(df[col_filtro_num].max())
+                rango_seleccionado = st.slider(
+                    f"Rango para {col_filtro_num}", 
+                    min_value=min_val, 
+                    max_value=max_val, 
+                    value=(min_val, max_val)
+                )
+                df = df[(df[col_filtro_num] >= rango_seleccionado[0]) & (df[col_filtro_num] <= rango_seleccionado[1])]
+                filtros_aplicados = True
 
-    if not columnas_disponibles:
-        st.info("No hay columnas disponibles para graficar. Asegúrate de que tus datos sean válidos.")
+    if df.empty:
+        st.warning("El conjunto de datos filtrado está vacío.")
+        st.stop()
+
+    # B. SELECCIÓN DE VARIABLES
+    st.subheader("B. Configuración de Visualización")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        eje_x = st.selectbox("Eje X (Categoría/Agrupación/Tiempo)", columnas_disponibles)
+    
+    with col2:
+        eje_y = st.selectbox("Eje Y (Valor/Medida)", [c for c in columnas_disponibles if c != eje_x])
+    
+    # C. TIPO DE GRÁFICO
+    st.markdown("---")
+    st.subheader("C. Selección de Gráfico y Agregación")
+    
+    tipos_grafico = [
+        'Barras', 
+        'Línea (Tendencia)', 
+        'Dispersión (Scatter)', 
+        'Histograma', 
+        'Caja (Box Plot)', 
+        'Circular (Pie Chart)'
+    ]
+    
+    tipo_grafico = st.selectbox("Selecciona el tipo de gráfico", tipos_grafico)
+    
+    # Configuración de agregación para gráficos de Barras/Línea/Circular
+    df_agregado = pd.DataFrame() # DataFrame para datos agregados
+
+    if tipo_grafico in ['Barras', 'Línea (Tendencia)', 'Circular (Pie Chart)']:
+        
+        columnas_numericas_y = df[eje_y].select_dtypes(include=['number']).columns.tolist()
+        
+        # Si el eje Y es numérico, ofrecemos agregación. Si no, contamos.
+        if eje_y in columnas_numericas_y:
+            metodos_agregacion = ['Suma', 'Promedio', 'Conteo']
+            metodo_agregacion = st.selectbox("Método de Agregación", metodos_agregacion)
+            
+            y_col_name = f'{metodo_agregacion} de {eje_y}'
+            
+            if metodo_agregacion == 'Suma':
+                df_agregado = df.groupby(eje_x, dropna=True)[eje_y].sum().reset_index(name=y_col_name)
+            elif metodo_agregacion == 'Promedio':
+                df_agregado = df.groupby(eje_x, dropna=True)[eje_y].mean().reset_index(name=y_col_name)
+            elif metodo_agregacion == 'Conteo':
+                df_agregado = df.groupby(eje_x, dropna=True).size().reset_index(name=y_col_name)
+        else:
+            # Conteo de ocurrencias si el eje Y no es numérico (e.g., Categorías)
+            metodo_agregacion = 'Conteo'
+            y_col_name = f'Conteo de {eje_y}'
+            df_agregado = df.groupby(eje_x, dropna=True).size().reset_index(name=y_col_name)
+            
+        df_para_grafico = df_agregado
+        x_col_name = eje_x
+
+    else:
+        # Para gráficos que usan datos brutos (Dispersión, Histograma, Caja)
+        df_para_grafico = df
+        df_agregado = pd.DataFrame() # Limpiar el agregado
+    
+    # D. VISUALIZACIÓN DEL GRÁFICO
+    st.subheader("D. Gráfico Generado")
+    
+    if df_para_grafico.empty:
+        st.warning("No hay datos para el gráfico después de la agregación o filtros.")
         return
 
-    # Selecciones del usuario
-    col1, col2, col3 = st.columns(3)
+    try:
+        if tipo_grafico == 'Barras':
+            fig = px.bar(df_para_grafico, x=x_col_name, y=y_col_name, title=f"Distribución: {y_col_name} por {eje_x}")
 
-    with col1:
-        tipo_grafico = st.selectbox(
-            "Selecciona Tipo de Gráfico:",
-            options=['Barras (Bar)', 'Línea (Line)', 'Dispersión (Scatter)', 'Histograma', 'Caja (Box Plot)', 'Circular (Pie)'],
-            key='chart_type'
-        )
-    
-    # Inicializar ejes a None
-    eje_x = None
-    eje_y = None
+        elif tipo_grafico == 'Circular (Pie Chart)':
+            fig = px.pie(
+                df_para_grafico, 
+                names=x_col_name, 
+                values=y_col_name, 
+                title=f"Distribución porcentual de {y_col_name} en {eje_x}"
+            )
 
-    # Lógica de selección de ejes basada en el tipo de gráfico
-    if tipo_grafico in ['Barras (Bar)', 'Caja (Box Plot)', 'Circular (Pie)']:
-        options_x = columnas_texto_fecha
-        options_y = columnas_numericas
-        
-        with col2:
-            eje_x = st.selectbox("Eje X / Etiquetas (Categoría):", options=options_x, index=0 if options_x else None, key='x_cat')
-        with col3:
-            eje_y = st.selectbox("Eje Y / Valores (Numérico):", options=[None] + options_y, index=1 if options_y else 0, key='y_num')
+        elif tipo_grafico == 'Línea (Tendencia)':
+            # Asegurar que el eje X pueda ser tratado como temporal o categórico ordenado
+            fig = px.line(df_para_grafico, x=x_col_name, y=y_col_name, title=f"Tendencia: {metodo_agregacion} de {eje_y} a lo largo de {eje_x}")
 
-    elif tipo_grafico == 'Línea (Line)':
-        options_x = columnas_fecha if columnas_fecha else columnas_texto_fecha
-        options_y = columnas_numericas
-        
-        with col2:
-            eje_x = st.selectbox("Eje X (Tiempo/Categoría):", options=options_x, index=0 if options_x else None, key='x_line')
-        with col3:
-            eje_y = st.selectbox("Eje Y (Valor Numérico):", options=[None] + options_y, index=1 if options_y else 0, key='y_line')
-    
-    elif tipo_grafico == 'Dispersión (Scatter)':
-        options_num = columnas_numericas
-        
-        with col2:
-            eje_x = st.selectbox("Eje X (Numérico):", options=options_num, index=0 if options_num else None, key='x_scatter')
-        with col3:
-            eje_y = st.selectbox("Eje Y (Numérico):", options=[None] + options_num, index=1 if options_num else 0, key='y_scatter')
-        
-    elif tipo_grafico == 'Histograma':
-        options_num = columnas_numericas
-        
-        with col2:
-            eje_y = st.selectbox("Columna (Numérica):", options=options_num, index=0 if options_num else None, key='y_hist')
-        eje_x = None # No aplica
-
-    
-    # Botón de generación
-    if st.button("Generar Gráfico", key='generate_chart_btn'):
-        # Validación
-        is_valid = True
-        required_cols = []
-        if tipo_grafico in ['Barras (Bar)', 'Línea (Line)', 'Caja (Box Plot)', 'Circular (Pie)']:
-            if not eje_x:
-                required_cols.append("Eje X")
-            if not eje_y:
-                required_cols.append("Eje Y")
         elif tipo_grafico == 'Dispersión (Scatter)':
-            if not eje_x:
-                required_cols.append("Eje X")
-            if not eje_y:
-                required_cols.append("Eje Y")
+            fig = px.scatter(df_para_grafico, x=eje_x, y=eje_y, title=f"Relación entre {eje_x} y {eje_y}", hover_data=columnas_disponibles)
+            
         elif tipo_grafico == 'Histograma':
-            if not eje_y:
-                required_cols.append("Columna")
-        
-        if required_cols:
-            st.warning(f"Por favor, selecciona las columnas necesarias para el tipo de gráfico elegido: {', '.join(required_cols)}.")
-            is_valid = False
+            # El histograma solo necesita un eje
+            fig = px.histogram(df_para_grafico, x=eje_y, title=f"Distribución de {eje_y}")
             
-        if is_valid and not df.empty:
-            # FIX: Asegurar que se limpian los NaNs en las columnas usadas, para evitar el RangeError
-            cols_to_clean = []
-            if eje_x and eje_x != 'None': cols_to_clean.append(eje_x)
-            if eje_y and eje_y != 'None': cols_to_clean.append(eje_y)
-
-            if cols_to_clean:
-                df_plot = df.dropna(subset=cols_to_clean).copy()
-            else:
-                df_plot = df.copy()
-
-            if df_plot.empty:
-                st.warning("El DataFrame queda vacío después de eliminar los valores faltantes (NaN) en las columnas seleccionadas.")
-                return
-
-            try:
-                generar_plot(df_plot, tipo_grafico, eje_x, eje_y, columnas_disponibles)
-            except Exception as e:
-                st.error(f"Error al generar el gráfico: {e}")
-        elif df.empty:
-            st.warning("No hay datos filtrados disponibles para graficar.")
-
-def generar_plot(df, tipo_grafico, eje_x, eje_y, columnas_disponibles):
-    """Función de Plotly para generar el gráfico."""
-    
-    # Lógica de agregación para gráficos de Barras/Línea/Circular
-    y_col_name = eje_y if eje_y else "conteo_de_filas"
-    df_agregado = df.copy()
-
-    if tipo_grafico in ['Barras (Bar)', 'Línea (Line)', 'Circular (Pie)'] and eje_x:
-        st.sidebar.markdown("##### Opciones de Agregación")
-        metodo_agregacion = st.sidebar.selectbox(
-             "Método de Agregación:",
-             options=['Suma', 'Promedio', 'Conteo'],
-             key='agg_method'
-         )
-
-        if metodo_agregacion == 'Conteo':
-            df_agregado = df.groupby(eje_x).size().reset_index(name='Conteo')
-            y_col_name = 'Conteo'
-        elif eje_y is None or eje_y not in df.select_dtypes(include=['number']).columns.tolist():
-             # Forzamos conteo si Y no es numérica y no se especificó un método de conteo
-             df_agregado = df.groupby(eje_x).size().reset_index(name='Conteo')
-             y_col_name = 'Conteo'
-        elif metodo_agregacion == 'Suma':
-            df_agregado = df.groupby(eje_x)[eje_y].sum().reset_index(name=f"Suma_de_{eje_y}")
-            y_col_name = f"Suma_de_{eje_y}"
-        elif metodo_agregacion == 'Promedio':
-            df_agregado = df.groupby(eje_x)[eje_y].mean().reset_index(name=f"Promedio_de_{eje_y}")
-            y_col_name = f"Promedio_de_{eje_y}"
-        
-        titulo_base = f"{metodo_agregacion} de {eje_y if eje_y else 'Filas'} por {eje_x}"
-
-        if tipo_grafico == 'Barras (Bar)':
-            fig = px.bar(df_agregado, x=eje_x, y=y_col_name, title=f"Barras: {titulo_base}")
-
-        elif tipo_grafico == 'Línea (Line)':
-            # Asegurarse de que el eje X esté ordenado si es una columna de fecha
-            if df_agregado[eje_x].dtype == 'datetime64[ns]':
-                df_agregado = df_agregado.sort_values(eje_x)
-            fig = px.line(df_agregado, x=eje_x, y=y_col_name, title=f"Línea: {titulo_base}")
-
-        elif tipo_grafico == 'Circular (Pie)':
-            # Para el gráfico circular, la columna de etiquetas se llama 'names' y la de valores 'values'
-            fig = px.pie(df_agregado, names=eje_x, values=y_col_name, title=f"Circular: Distribución porcentual de {y_col_name} por {eje_x}")
+        elif tipo_grafico == 'Caja (Box Plot)':
+            fig = px.box(df_para_grafico, x=eje_x, y=eje_y, title=f"Distribución de {eje_y} por {eje_x}")
             
-    # Gráficos sin agregación (usan el DF limpio directamente)
-    elif tipo_grafico == 'Dispersión (Scatter)':
-        fig = px.scatter(df, x=eje_x, y=eje_y, title=f"Dispersión: Relación entre {eje_x} y {eje_y}", hover_data=columnas_disponibles)
-        
-    elif tipo_grafico == 'Histograma':
-        fig = px.histogram(df, x=eje_y, title=f"Histograma: Distribución de {eje_y}")
-        
-    elif tipo_grafico == 'Caja (Box Plot)':
-        fig = px.box(df, x=eje_x, y=eje_y, title=f"Caja: Distribución de {eje_y} por {eje_x}")
-        
-    st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True)
 
+    except Exception as e:
+        st.error(f"Ocurrió un error al generar el gráfico. Asegúrate de que las columnas sean adecuadas para el tipo de gráfico: {e}")
+        return # Detener la ejecución si el gráfico falla
     
-# ----------------------------------------------------
-# 6. FUNCIÓN DE DESCARGA DE DATAFRAME
-# ----------------------------------------------------
-def descargar_dataframe(df, filename="datos_filtrados.csv"):
-    """Genera un botón de descarga para el DataFrame."""
     
-    # Convertir el DataFrame a CSV con delimitador de punto y coma (más compatible con Excel en español)
-    csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig')
-    b64 = base64.b64encode(csv.encode()).decode()
+    # ------------------------------------
+    # E. INSIGHT GENERADO POR LENGUAJE NATURAL (LLM REAL)
+    # ------------------------------------
+    st.markdown("---")
+    st.header("🧠 Insight Generado por NydIA (IA)")
     
-    # Crear el enlace de descarga
-    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="st-emotion-cache-nahz7x e1nzilvr5">Descargar Datos Filtrados ({len(df)} filas)</a>'
-    st.markdown(href, unsafe_allow_html=True)
+    # Usar el DataFrame agregado para Linea/Barra/Circular, o el filtrado para el resto.
+    df_insight = df_agregado if not df_agregado.empty else df
+    
+    if not df_insight.empty:
+        with st.spinner("Analizando datos y generando insight con Gemini..."):
+            # LLAMADA REAL A LA IA
+            insight = generar_insight_con_gemini(df_insight, eje_x, eje_y, tipo_grafico, pregunta_nlp)
+        
+        # Mostrar el insight
+        st.info(f"**Análisis Profundo de NydIA:**\n\n{insight}")
+    else:
+        st.info("No hay datos suficientes para generar un insight profundo.")
+
+
+    st.markdown("---")
+    st.caption(f"Filas originales consolidadas: {len(df_original)} | Filas analizadas después de filtros: {len(df)}")
 
 
 # ----------------------------------------------------
-# 7. EL BUCLE PRINCIPAL DEL AGENTE
+# 4. EL BUCLE PRINCIPAL DEL AGENTE
 # ----------------------------------------------------
 def main():
     
-    # Inicialización del estado de sesión
-    if 'df_original' not in st.session_state:
-        st.session_state.df_original = pd.DataFrame()
-    if 'df_filtrado' not in st.session_state:
-        st.session_state.df_filtrado = pd.DataFrame()
-    if 'llm_response' not in st.session_state:
-        st.session_state.llm_response = ""
-        
-    # --- Columna Lateral para Carga y Filtros ---
-    with st.sidebar:
-        st.header("1. Carga de Datos")
-        uploaded_files = st.file_uploader(
-            "Carga tus archivos de datos (.csv, .xls/.xlsx)",
-            type=['csv', 'xls', 'xlsx'],
-            accept_multiple_files=True
-        )
-        
-        # Lógica de carga y consolidación
-        if uploaded_files and (st.session_state.df_original.empty or st.button("Recargar Archivos", key='reload_btn')):
-            with st.spinner('Consolidando y limpiando datos...'):
-                df_cargado = consolidar_archivos(uploaded_files)
-                if not df_cargado.empty:
-                    st.session_state.df_original = limpiar_y_preparar_datos(df_cargado)
-                    st.session_state.df_filtrado = st.session_state.df_original.copy()
-                    st.session_state.llm_response = "" # Limpiar respuesta de IA
-                    st.success("Archivos consolidados y listos para el análisis.")
-                else:
-                    st.session_state.df_original = pd.DataFrame()
-                    st.error("No se pudieron cargar datos válidos.")
-
+    st.title("NydIA: Agente de Análisis de Datos con IA")
+    st.markdown("Carga tus archivos y usa lenguaje natural para obtener *insights* impulsados por **Gemini**.")
     
-    df_original = st.session_state.df_original
-    
-    if df_original.empty:
-        st.info("Por favor, carga uno o más archivos para comenzar el análisis de NydIA.")
-        return
+    uploaded_files = st.file_uploader(
+        "Carga tus archivos de Excel (.xls/.xlsx) o CSV (separado por comas/punto y coma):", 
+        type=["xlsx", "xls", "csv"], 
+        accept_multiple_files=True
+    )
 
-    # --- Aplicación de Filtros (si el DF original existe) ---
-    df_actualizado = aplicar_filtros(df_original)
-    
-    # --- Contenido Principal de la Aplicación ---
-    st.title("NydIA 🧠: Agente de Análisis de Datos Asistido por IA")
-    
-    col_viz, col_data_info = st.columns([3, 1])
-
-    with col_data_info:
-        st.markdown("### 3. Resumen de Datos")
-        st.metric("Filas Originales", len(df_original))
-        st.metric("Filas Filtradas", len(df_actualizado))
-        st.metric("Columnas", len(df_actualizado.columns))
+    if uploaded_files:
+        df_consolidado = consolidar_archivos(uploaded_files)
         
-        # Botón de descarga
-        st.markdown("---")
-        descargar_dataframe(df_actualizado)
-        
-        st.markdown("---")
-        st.markdown("#### Estructura de Datos (DTypes)")
-        st.dataframe(df_actualizado.dtypes.astype(str).reset_index().rename(columns={'index': 'Columna', 0: 'Tipo'}), 
-                     hide_index=True, use_container_width=True)
+        if not df_consolidado.empty:
+            
+            st.success(f"Archivos cargados y consolidados: {len(df_consolidado)} filas y {len(df_consolidado.columns)} columnas.")
+            
+            # Mostrar el DataFrame (opcional)
+            with st.expander("Ver Datos Consolidados (Primeras 10 filas)"):
+                st.dataframe(df_consolidado.head(10), use_container_width=True)
+            
+            st.markdown("---")
+            
+            # Pregunta de Lenguaje Natural (NLQ - Natural Language Query)
+            pregunta_nlp = st.text_input(
+                "Pregunta a NydIA (e.g., ¿Cuál es el producto más vendido en el último trimestre?)",
+                value="¿Qué tendencia muestra el promedio de ventas por región?" # Sugerencia
+            )
+            
+            if st.button("🚀 Iniciar Análisis", type="primary"):
+                seccion_analisis(df_consolidado, pregunta_nlp)
 
-
-    with col_viz:
-        st.markdown("### 4. Asistente de Análisis (Gemini)")
-        user_query = st.text_area(
-            "Escribe tu pregunta o solicitud de análisis (ej. 'Analiza la tendencia de las ventas por mes', '¿Cuál es el mejor gráfico para correlacionar precio y cantidad?'):",
-            key='llm_query',
-            height=100
-        )
-
-        if st.button("Ejecutar Análisis", key='run_llm'):
-            if user_query:
-                with st.spinner("Analizando con Gemini (esto puede tardar unos segundos)..."):
-                    # Usar una muestra si el DF filtrado es muy grande (ej. > 1000 filas)
-                    df_to_analyze = df_actualizado.sample(min(1000, len(df_actualizado))) if len(df_actualizado) > 1000 else df_actualizado
-                    
-                    # Llamar al agente
-                    respuesta = agente_analisis_llm(df_to_analyze, user_query)
-                    st.session_state.llm_response = respuesta
-            else:
-                st.warning("Por favor, ingresa una consulta para ejecutar el análisis.")
-        
-        if st.session_state.llm_response:
-             st.markdown("#### 💬 Respuesta del Agente NydIA:")
-             st.markdown(st.session_state.llm_response)
         else:
-             st.info("La respuesta de la IA aparecerá aquí después de ejecutar el análisis.")
+            st.warning("No se pudieron consolidar los datos de los archivos cargados.")
+    else:
+        st.info("Por favor, sube uno o más archivos de datos para comenzar el análisis.")
 
-        st.markdown("---")
-        
-        # --- Sección de Visualización ---
-        generar_grafico_interactivo(df_original, df_actualizado)
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
