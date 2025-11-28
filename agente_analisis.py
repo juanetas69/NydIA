@@ -234,7 +234,14 @@ def seccion_analisis(df_original, pregunta_nlp):
 
     if tipo_grafico in ['Barras', 'Línea (Tendencia)', 'Circular (Pie Chart)']:
         
-        columnas_numericas_y = df[eje_y].select_dtypes(include=['number']).columns.tolist()
+        # CORRECCIÓN: Usar df[[eje_y]] para convertir la Series en un DataFrame de 1 columna
+        # y así poder usar .columns.tolist() sin el AttributeError.
+        try:
+            columnas_numericas_y = df[[eje_y]].select_dtypes(include=['number']).columns.tolist()
+        except KeyError:
+            # Manejar el caso si la columna 'eje_y' no existe, aunque debería existir si se seleccionó arriba.
+            # En la práctica, Streamlit asegura que 'eje_y' esté en 'df.columns' si no hay errores en la UI.
+            columnas_numericas_y = [] 
         
         # Si el eje Y es numérico, ofrecemos agregación. Si no, contamos.
         if eje_y in columnas_numericas_y:
